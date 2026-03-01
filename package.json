@@ -1,0 +1,15 @@
+{
+  "name": "autotrade-relay",
+  "version": "1.0.0",
+  "description": "WebSocket relay for autotrade / autoaccept",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  },
+  "engines": {
+    "node": "20.x"
+  }
+}
