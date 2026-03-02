@@ -1,15 +1,16 @@
 {
-  "name": "autotrade-relay",
+  "name": "adopt-me-trade-relay",
   "version": "1.0.0",
-  "description": "WebSocket relay for autotrade / autoaccept",
-  "main": "relay.js",
+  "description": "Relay server for Adopt Me trade automation",
+  "main": "server.js",
   "scripts": {
-    "start": "node relay.js"
-  },
-  "dependencies": {
-    "ws": "8.18.0"
+    "start": "node server.js"
   },
   "engines": {
-    "node": "20.x"
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "express": "^4.18.2"
   }
 }
